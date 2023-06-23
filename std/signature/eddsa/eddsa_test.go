@@ -191,9 +191,10 @@ type updatedRateLimitedTokenCircuit struct {
 	curveID tedwards.ID
 
 	// Old state
-	PreviousCounter    frontend.Variable `gnark:"prev_counter"`
-	PreviousCommitment frontend.Variable `gnark:"prev_commitment"`
-	PublicNonce        frontend.Variable `gnark:"public_nonce,public"`
+	PreviousCommitmentNonce frontend.Variable `gnark:"prev_commitment_nonce"`
+	PreviousCounter         frontend.Variable `gnark:"prev_counter"`
+	PreviousCommitment      frontend.Variable `gnark:"prev_commitment"`
+	PreviousNonce           frontend.Variable `gnark:"prev_nonce,public"`
 
 	// New state
 	CommitmentNonce frontend.Variable `gnark:"commitment_nonce"`
@@ -246,17 +247,28 @@ func (circuit *updatedRateLimitedTokenCircuit) Define(api frontend.API) error {
 	// Assert that the counter is less than CONSTANT (=1 for testing purposes)
 	curve.API().AssertIsLessOrEqual(circuit.Counter, 1)
 
-	// Assert that the commitment matches the public witness
+	// Assert that the old commitment matches the old values
 	hasher, err = mimc.NewMiMC(api)
 	if err != nil {
 		return err
 	}
 	hash := &hasher
+	hash.Write(circuit.PreviousCommitmentNonce)
+	hash.Write(circuit.PreviousNonce)
+	hash.Write(circuit.PreviousCounter)
+	digest := hash.Sum()
+	curve.API().AssertIsEqual(digest, circuit.PreviousCommitment)
+
+	// Assert that the commitment matches the public witness
+	hasher, err = mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+	hash = &hasher
 	hash.Write(circuit.CommitmentNonce)
-	hash.Write(circuit.PublicNonce)
 	hash.Write(circuit.PrivateNonce)
 	hash.Write(circuit.Counter)
-	digest := hash.Sum()
+	digest = hash.Sum()
 	curve.API().AssertIsEqual(digest, circuit.Commitment)
 
 	return nil
@@ -359,8 +371,6 @@ func TestMyCircuit(t *testing.T) {
 	newMimc := hash.New()
 	newCommitmentNonce.FillBytes(buffer)
 	newMimc.Write(buffer)
-	nonce.FillBytes(buffer)
-	newMimc.Write(buffer)
 	newNonce.FillBytes(buffer)
 	newMimc.Write(buffer)
 	newCounter.FillBytes(buffer)
@@ -377,9 +387,10 @@ func TestMyCircuit(t *testing.T) {
 	// Construct the witness for verification of the updated token state
 	var updatedWitness updatedRateLimitedTokenCircuit
 	updatedWitness.curveID = curve
+	updatedWitness.PreviousCommitmentNonce = commitmentNonce
 	updatedWitness.PreviousCounter = counter
 	updatedWitness.PreviousCommitment = commitment
-	updatedWitness.PublicNonce = nonce // make the old nonce public to the verifier
+	updatedWitness.PreviousNonce = nonce // make the old nonce public to the verifier
 	updatedWitness.CommitmentNonce = newCommitmentNonce
 	updatedWitness.PrivateNonce = newNonce
 	updatedWitness.Counter = newCounter
@@ -405,14 +416,15 @@ func TestMyCircuit(t *testing.T) {
 
 	// Create the proof of the initial token state
 	newAssignment := &updatedRateLimitedTokenCircuit{
-		curveID:            curve,
-		PreviousCounter:    counter,
-		PreviousCommitment: commitment,
-		PublicNonce:        nonce,
-		CommitmentNonce:    newCommitmentNonce,
-		PrivateNonce:       newNonce,
-		Counter:            newCounter,
-		Commitment:         newCommitment,
+		curveID:                 curve,
+		PreviousCommitmentNonce: commitmentNonce,
+		PreviousCounter:         counter,
+		PreviousCommitment:      commitment,
+		PreviousNonce:           nonce,
+		CommitmentNonce:         newCommitmentNonce,
+		PrivateNonce:            newNonce,
+		Counter:                 newCounter,
+		Commitment:              newCommitment,
 	}
 	newAssignment.VerifyingKey.Assign(curve, pubKey.Bytes())
 	newAssignment.OriginKey.Assign(curve, originPrivateKey.Public().Bytes())
@@ -446,9 +458,7 @@ func TestMyCircuit(t *testing.T) {
 	finalMimc := hash.New()
 	finalCommitmentNonce.FillBytes(buffer)
 	finalMimc.Write(buffer)
-	nonce.FillBytes(buffer)
-	finalMimc.Write(buffer)
-	newNonce.FillBytes(buffer)
+	finalNonce.FillBytes(buffer)
 	finalMimc.Write(buffer)
 	newCounter.FillBytes(buffer)
 	finalMimc.Write(buffer)
@@ -464,9 +474,10 @@ func TestMyCircuit(t *testing.T) {
 	// Construct the witness for verification of the updated token state
 	var finalWitness updatedRateLimitedTokenCircuit
 	finalWitness.curveID = curve
+	finalWitness.PreviousCommitmentNonce = newCommitmentNonce
 	finalWitness.PreviousCounter = newCounter
 	finalWitness.PreviousCommitment = newCommitment
-	finalWitness.PublicNonce = newNonce // make the old nonce public to the verifier
+	finalWitness.PreviousNonce = newNonce // make the old nonce public to the verifier
 	finalWitness.CommitmentNonce = finalCommitmentNonce
 	finalWitness.PrivateNonce = finalNonce
 	finalWitness.Counter = finalCounter
