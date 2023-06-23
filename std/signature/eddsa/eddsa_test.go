@@ -154,11 +154,11 @@ func TestEddsa(t *testing.T) {
 //  Origin: Verify ZKP and sign the commitment
 
 type rateLimitedTokenCircuit struct {
-	curveID         tedwards.ID
-	CommitmentNonce frontend.Variable `gnark:"commitment_nonce"`
-	Nonce           frontend.Variable `gnark:"nonce"`
-	Counter         frontend.Variable `gnark:"counter"`
-	Commitment      frontend.Variable `gnark:"commitment,public"`
+	curveID              tedwards.ID
+	CommitmentRandomizer frontend.Variable `gnark:"commitment_randomizer"`
+	Nonce                frontend.Variable `gnark:"nonce"`
+	Counter              frontend.Variable `gnark:"counter"`
+	Commitment           frontend.Variable `gnark:"commitment,public"`
 }
 
 func (circuit *rateLimitedTokenCircuit) Define(api frontend.API) error {
@@ -178,7 +178,7 @@ func (circuit *rateLimitedTokenCircuit) Define(api frontend.API) error {
 
 	// Assert that the commitment matches the public witness
 	hash := &mimc
-	hash.Write(circuit.CommitmentNonce)
+	hash.Write(circuit.CommitmentRandomizer)
 	hash.Write(circuit.Nonce)
 	hash.Write(circuit.Counter)
 	digest := hash.Sum()
@@ -191,16 +191,16 @@ type updatedRateLimitedTokenCircuit struct {
 	curveID tedwards.ID
 
 	// Old state
-	PreviousCommitmentNonce frontend.Variable `gnark:"prev_commitment_nonce"`
-	PreviousCounter         frontend.Variable `gnark:"prev_counter"`
-	PreviousCommitment      frontend.Variable `gnark:"prev_commitment"`
-	PreviousNonce           frontend.Variable `gnark:"prev_nonce,public"`
+	PreviousCommitmentRandomizer frontend.Variable `gnark:"prev_commitment_randomizer"`
+	PreviousCounter              frontend.Variable `gnark:"prev_counter"`
+	PreviousCommitment           frontend.Variable `gnark:"prev_commitment"`
+	PreviousNonce                frontend.Variable `gnark:"prev_nonce,public"`
 
 	// New state
-	CommitmentNonce frontend.Variable `gnark:"commitment_nonce"`
-	PrivateNonce    frontend.Variable `gnark:"private_nonce"`
-	Counter         frontend.Variable `gnark:"counter"`
-	Commitment      frontend.Variable `gnark:"commitment,public"`
+	CommitmentRandomizer frontend.Variable `gnark:"commitment_randomizer"`
+	Nonce                frontend.Variable `gnark:"nonce"`
+	Counter              frontend.Variable `gnark:"counter"`
+	Commitment           frontend.Variable `gnark:"commitment,public"`
 
 	// Verification information over old state
 	OriginKey    PublicKey `gnark:"origin_key,public"`
@@ -253,7 +253,7 @@ func (circuit *updatedRateLimitedTokenCircuit) Define(api frontend.API) error {
 		return err
 	}
 	hash := &hasher
-	hash.Write(circuit.PreviousCommitmentNonce)
+	hash.Write(circuit.PreviousCommitmentRandomizer)
 	hash.Write(circuit.PreviousNonce)
 	hash.Write(circuit.PreviousCounter)
 	digest := hash.Sum()
@@ -265,8 +265,8 @@ func (circuit *updatedRateLimitedTokenCircuit) Define(api frontend.API) error {
 		return err
 	}
 	hash = &hasher
-	hash.Write(circuit.CommitmentNonce)
-	hash.Write(circuit.PrivateNonce)
+	hash.Write(circuit.CommitmentRandomizer)
+	hash.Write(circuit.Nonce)
 	hash.Write(circuit.Counter)
 	digest = hash.Sum()
 	curve.API().AssertIsEqual(digest, circuit.Commitment)
@@ -301,10 +301,10 @@ func TestMyCircuit(t *testing.T) {
 
 	// Compute the commitment to this state
 	buffer := make([]byte, 32) // XXX(caw): get the size of the underlying field rather than assume 32 bytes here
-	var commitmentNonce big.Int
-	commitmentNonce.Rand(randomness, snarkField)
+	var commitmentRandomizer big.Int
+	commitmentRandomizer.Rand(randomness, snarkField)
 	mimc := hash.New()
-	commitmentNonce.FillBytes(buffer)
+	commitmentRandomizer.FillBytes(buffer)
 	mimc.Write(buffer)
 	nonce.FillBytes(buffer)
 	mimc.Write(buffer)
@@ -317,7 +317,7 @@ func TestMyCircuit(t *testing.T) {
 
 	// Construct the witness for verification
 	var witness rateLimitedTokenCircuit
-	witness.CommitmentNonce = commitmentNonce
+	witness.CommitmentRandomizer = commitmentRandomizer
 	witness.Nonce = nonce
 	witness.Counter = counter
 	witness.Commitment = commitment
@@ -332,11 +332,11 @@ func TestMyCircuit(t *testing.T) {
 
 	// Create the proof of the initial token state
 	assignment := &rateLimitedTokenCircuit{
-		curveID:         curve,
-		CommitmentNonce: commitmentNonce,
-		Nonce:           nonce,
-		Counter:         counter,
-		Commitment:      commitment,
+		curveID:              curve,
+		CommitmentRandomizer: commitmentRandomizer,
+		Nonce:                nonce,
+		Counter:              counter,
+		Commitment:           commitment,
 	}
 	proofWitness, err := frontend.NewWitness(assignment, snarkField)
 	assert.Nil(err)
@@ -366,10 +366,10 @@ func TestMyCircuit(t *testing.T) {
 	newCounter.SetUint64(counter.Uint64() + 1)
 
 	// Compute commitment to this new state
-	var newCommitmentNonce big.Int
-	newCommitmentNonce.Rand(randomness, snarkField)
+	var newCommitmentRandomizer big.Int
+	newCommitmentRandomizer.Rand(randomness, snarkField)
 	newMimc := hash.New()
-	newCommitmentNonce.FillBytes(buffer)
+	newCommitmentRandomizer.FillBytes(buffer)
 	newMimc.Write(buffer)
 	newNonce.FillBytes(buffer)
 	newMimc.Write(buffer)
@@ -387,12 +387,12 @@ func TestMyCircuit(t *testing.T) {
 	// Construct the witness for verification of the updated token state
 	var updatedWitness updatedRateLimitedTokenCircuit
 	updatedWitness.curveID = curve
-	updatedWitness.PreviousCommitmentNonce = commitmentNonce
+	updatedWitness.PreviousCommitmentRandomizer = commitmentRandomizer
 	updatedWitness.PreviousCounter = counter
 	updatedWitness.PreviousCommitment = commitment
 	updatedWitness.PreviousNonce = nonce // make the old nonce public to the verifier
-	updatedWitness.CommitmentNonce = newCommitmentNonce
-	updatedWitness.PrivateNonce = newNonce
+	updatedWitness.CommitmentRandomizer = newCommitmentRandomizer
+	updatedWitness.Nonce = newNonce
 	updatedWitness.Counter = newCounter
 	updatedWitness.Commitment = newCommitment
 	updatedWitness.VerifyingKey.Assign(curve, pubKey.Bytes())
@@ -416,15 +416,15 @@ func TestMyCircuit(t *testing.T) {
 
 	// Create the proof of the initial token state
 	newAssignment := &updatedRateLimitedTokenCircuit{
-		curveID:                 curve,
-		PreviousCommitmentNonce: commitmentNonce,
-		PreviousCounter:         counter,
-		PreviousCommitment:      commitment,
-		PreviousNonce:           nonce,
-		CommitmentNonce:         newCommitmentNonce,
-		PrivateNonce:            newNonce,
-		Counter:                 newCounter,
-		Commitment:              newCommitment,
+		curveID:                      curve,
+		PreviousCommitmentRandomizer: commitmentRandomizer,
+		PreviousCounter:              counter,
+		PreviousCommitment:           commitment,
+		PreviousNonce:                nonce,
+		CommitmentRandomizer:         newCommitmentRandomizer,
+		Nonce:                        newNonce,
+		Counter:                      newCounter,
+		Commitment:                   newCommitment,
 	}
 	newAssignment.VerifyingKey.Assign(curve, pubKey.Bytes())
 	newAssignment.OriginKey.Assign(curve, originPrivateKey.Public().Bytes())
@@ -453,10 +453,10 @@ func TestMyCircuit(t *testing.T) {
 	finalCounter.SetUint64(newCounter.Uint64() + 1)
 
 	// Compute commitment to this new state
-	var finalCommitmentNonce big.Int
-	finalCommitmentNonce.Rand(randomness, snarkField)
+	var finalCommitmentRandomizer big.Int
+	finalCommitmentRandomizer.Rand(randomness, snarkField)
 	finalMimc := hash.New()
-	finalCommitmentNonce.FillBytes(buffer)
+	finalCommitmentRandomizer.FillBytes(buffer)
 	finalMimc.Write(buffer)
 	finalNonce.FillBytes(buffer)
 	finalMimc.Write(buffer)
@@ -474,12 +474,12 @@ func TestMyCircuit(t *testing.T) {
 	// Construct the witness for verification of the updated token state
 	var finalWitness updatedRateLimitedTokenCircuit
 	finalWitness.curveID = curve
-	finalWitness.PreviousCommitmentNonce = newCommitmentNonce
+	finalWitness.PreviousCommitmentRandomizer = newCommitmentRandomizer
 	finalWitness.PreviousCounter = newCounter
 	finalWitness.PreviousCommitment = newCommitment
 	finalWitness.PreviousNonce = newNonce // make the old nonce public to the verifier
-	finalWitness.CommitmentNonce = finalCommitmentNonce
-	finalWitness.PrivateNonce = finalNonce
+	finalWitness.CommitmentRandomizer = finalCommitmentRandomizer
+	finalWitness.Nonce = finalNonce
 	finalWitness.Counter = finalCounter
 	finalWitness.Commitment = finalCommitment
 	finalWitness.VerifyingKey.Assign(curve, originPrivateKey.Public().Bytes())
@@ -487,6 +487,6 @@ func TestMyCircuit(t *testing.T) {
 	finalWitness.IssuerKey.Assign(curve, issuerPrivateKey.Public().Bytes())
 	finalWitness.Signature.Assign(curve, updatedSignature)
 
-	// Check that it succeeds
+	// Check that it fails (since the limit is hit)
 	assert.SolvingSucceeded(&finalCircuit, &finalWitness, test.WithCurves(snarkCurve))
 }
