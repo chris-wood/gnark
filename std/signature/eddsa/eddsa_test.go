@@ -23,9 +23,11 @@ import (
 	"time"
 
 	tedwards "github.com/consensys/gnark-crypto/ecc/twistededwards"
-	"github.com/consensys/gnark-crypto/hash"
+	chash "github.com/consensys/gnark-crypto/hash"
 	"github.com/consensys/gnark-crypto/signature/eddsa"
+	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/frontend"
+	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/internal/utils"
 	"github.com/consensys/gnark/std/algebra/twistededwards"
 	"github.com/consensys/gnark/std/hash/mimc"
@@ -60,19 +62,19 @@ func TestEddsa(t *testing.T) {
 	assert := test.NewAssert(t)
 
 	type testData struct {
-		hash  hash.Hash
+		hash  chash.Hash
 		curve tedwards.ID
 	}
 
 	confs := []testData{
-		{hash.MIMC_BN254, tedwards.BN254},
-		{hash.MIMC_BLS12_381, tedwards.BLS12_381},
+		{chash.MIMC_BN254, tedwards.BN254},
+		{chash.MIMC_BLS12_381, tedwards.BLS12_381},
 		// {hash.MIMC_BLS12_381, tedwards.BLS12_381_BANDERSNATCH},
-		{hash.MIMC_BLS12_377, tedwards.BLS12_377},
-		{hash.MIMC_BW6_761, tedwards.BW6_761},
-		{hash.MIMC_BLS24_315, tedwards.BLS24_315},
-		{hash.MIMC_BLS24_317, tedwards.BLS24_317},
-		{hash.MIMC_BW6_633, tedwards.BW6_633},
+		{chash.MIMC_BLS12_377, tedwards.BLS12_377},
+		{chash.MIMC_BW6_761, tedwards.BW6_761},
+		{chash.MIMC_BLS24_315, tedwards.BLS24_315},
+		{chash.MIMC_BLS24_317, tedwards.BLS24_317},
+		{chash.MIMC_BW6_633, tedwards.BW6_633},
 	}
 
 	bound := 5
@@ -141,5 +143,339 @@ func TestEddsa(t *testing.T) {
 
 		}
 	}
+}
 
+// Issuance:
+//  Client: Create state (nonce, timestamp, zero counter), commitment to state, and ZKP(counter == 0, timestamp matches)
+//  Issuer: Verify ZKP and sign the commitment
+
+// Redemption
+//  Client: Create state (nonce', timestamp, counter+1), commitment to state, ZKP(know signature over old commitment with nonce, counter++, timestamp matches, counter < LIMIT), old nonce
+//  Origin: Verify ZKP and sign the commitment
+
+type rateLimitedTokenCircuit struct {
+	curveID         tedwards.ID
+	CommitmentNonce frontend.Variable `gnark:"commitment_nonce"`
+	Nonce           frontend.Variable `gnark:"nonce"`
+	Counter         frontend.Variable `gnark:"counter"`
+	Commitment      frontend.Variable `gnark:"commitment,public"`
+}
+
+func (circuit *rateLimitedTokenCircuit) Define(api frontend.API) error {
+	curve, err := twistededwards.NewEdCurve(api, circuit.curveID)
+	if err != nil {
+		return err
+	}
+
+	mimc, err := mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+
+	// Assert that the counter is 0
+	isZero := curve.API().IsZero(circuit.Counter)
+	curve.API().AssertIsEqual(isZero, 1)
+
+	// Assert that the commitment matches the public witness
+	hash := &mimc
+	hash.Write(circuit.CommitmentNonce)
+	hash.Write(circuit.Nonce)
+	hash.Write(circuit.Counter)
+	digest := hash.Sum()
+	curve.API().AssertIsEqual(digest, circuit.Commitment)
+
+	return nil
+}
+
+type updatedRateLimitedTokenCircuit struct {
+	curveID tedwards.ID
+
+	// Old state
+	PreviousCounter    frontend.Variable `gnark:"prev_counter"`
+	PreviousCommitment frontend.Variable `gnark:"prev_commitment"`
+	PublicNonce        frontend.Variable `gnark:"public_nonce,public"`
+
+	// New state
+	CommitmentNonce frontend.Variable `gnark:"commitment_nonce"`
+	PrivateNonce    frontend.Variable `gnark:"private_nonce"`
+	Counter         frontend.Variable `gnark:"counter"`
+	Commitment      frontend.Variable `gnark:"commitment,public"`
+
+	// Verification information over old state
+	OriginKey    PublicKey `gnark:"origin_key,public"`
+	IssuerKey    PublicKey `gnark:"issuer_key,public"`
+	VerifyingKey PublicKey `gnark:"verifying_key"`
+	Signature    Signature `gnark:"signature"`
+}
+
+// ZKP(know signature over old commitment with nonce, counter++, counter < LIMIT)
+func (circuit *updatedRateLimitedTokenCircuit) Define(api frontend.API) error {
+	curve, err := twistededwards.NewEdCurve(api, circuit.curveID)
+	if err != nil {
+		return err
+	}
+
+	hasher, err := mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+
+	// Assert that the signature over the counter is valid
+	Verify(curve, circuit.Signature, circuit.PreviousCommitment, circuit.VerifyingKey, &hasher)
+
+	// Assert that the verification key is either the issuer's or the origin's, but don't reveal which one
+	isIssuerCompareX := curve.API().Cmp(circuit.VerifyingKey.A.X, circuit.IssuerKey.A.X)
+	isIssuerCompareXResult := curve.API().IsZero(isIssuerCompareX)
+	isIssuerCompareY := curve.API().Cmp(circuit.VerifyingKey.A.Y, circuit.IssuerKey.A.Y)
+	isIssuerCompareYResult := curve.API().IsZero(isIssuerCompareY)
+	isIssuerCompare := curve.API().And(isIssuerCompareXResult, isIssuerCompareYResult) // isIssuerCompare = (X == X) & (Y == Y)
+
+	isOriginCompareX := curve.API().Cmp(circuit.VerifyingKey.A.X, circuit.OriginKey.A.X)
+	isOriginCompareXResult := curve.API().IsZero(isOriginCompareX)
+	isOriginCompareY := curve.API().Cmp(circuit.VerifyingKey.A.Y, circuit.OriginKey.A.Y)
+	isOriginCompareYResult := curve.API().IsZero(isOriginCompareY)
+	isOriginCompare := curve.API().And(isOriginCompareXResult, isOriginCompareYResult) // isOriginCompare = (X == X) || (Y == Y)
+
+	eitherOr := curve.API().Or(isIssuerCompare, isOriginCompare) // eitherOr = 1 iff (isIssuerCompare == 1 || isOriginCompare == 1)
+	curve.API().AssertIsEqual(eitherOr, 1)
+
+	// Assert that the counter is an updated version of the previous counter
+	newCounter := curve.API().Add(circuit.PreviousCounter, 1)
+	curve.API().AssertIsEqual(newCounter, circuit.Counter)
+
+	// Assert that the counter is less than CONSTANT (=1 for testing purposes)
+	curve.API().AssertIsLessOrEqual(circuit.Counter, 1)
+
+	// Assert that the commitment matches the public witness
+	hasher, err = mimc.NewMiMC(api)
+	if err != nil {
+		return err
+	}
+	hash := &hasher
+	hash.Write(circuit.CommitmentNonce)
+	hash.Write(circuit.PublicNonce)
+	hash.Write(circuit.PrivateNonce)
+	hash.Write(circuit.Counter)
+	digest := hash.Sum()
+	curve.API().AssertIsEqual(digest, circuit.Commitment)
+
+	return nil
+}
+
+func TestMyCircuit(t *testing.T) {
+	assert := test.NewAssert(t)
+	hash := chash.MIMC_BN254
+	curve := tedwards.BN254
+
+	snarkField, err := twistededwards.GetSnarkField(curve)
+	assert.NoError(err)
+	snarkCurve := utils.FieldToCurve(snarkField)
+
+	randomness := rand.New(rand.NewSource(0))
+
+	// Generate the issuer key pair
+	issuerPrivateKey, err := eddsa.New(curve, randomness)
+	assert.NoError(err, "generating issuer key pair")
+
+	// Generate the origin key pair
+	originPrivateKey, err := eddsa.New(curve, randomness)
+	assert.NoError(err, "generating origin key pair")
+
+	// Initial state: a random nonce and counter set to 0
+	var nonce big.Int
+	nonce.Rand(randomness, snarkField)
+	var counter big.Int
+	counter.SetUint64(0)
+
+	// Compute the commitment to this state
+	buffer := make([]byte, 32) // XXX(caw): get the size of the underlying field rather than assume 32 bytes here
+	var commitmentNonce big.Int
+	commitmentNonce.Rand(randomness, snarkField)
+	mimc := hash.New()
+	commitmentNonce.FillBytes(buffer)
+	mimc.Write(buffer)
+	nonce.FillBytes(buffer)
+	mimc.Write(buffer)
+	counter.FillBytes(buffer)
+	mimc.Write(buffer)
+	commitment := mimc.Sum(nil)
+
+	var circuit rateLimitedTokenCircuit
+	circuit.curveID = curve
+
+	// Construct the witness for verification
+	var witness rateLimitedTokenCircuit
+	witness.CommitmentNonce = commitmentNonce
+	witness.Nonce = nonce
+	witness.Counter = counter
+	witness.Commitment = commitment
+
+	assert.SolvingSucceeded(&circuit, &witness, test.WithCurves(snarkCurve))
+
+	// Setup the proof system
+	cs, err := frontend.Compile(snarkField, r1cs.NewBuilder, &circuit)
+	assert.Nil(err)
+	pk, vk, err := groth16.Setup(cs)
+	assert.Nil(err)
+
+	// Create the proof of the initial token state
+	assignment := &rateLimitedTokenCircuit{
+		curveID:         curve,
+		CommitmentNonce: commitmentNonce,
+		Nonce:           nonce,
+		Counter:         counter,
+		Commitment:      commitment,
+	}
+	proofWitness, err := frontend.NewWitness(assignment, snarkField)
+	assert.Nil(err)
+	proof, err := groth16.Prove(cs, pk, proofWitness)
+	assert.Nil(err)
+
+	// Verify the proof
+	publicWitness, err := proofWitness.Public()
+	assert.Nil(err)
+	err = groth16.Verify(proof, vk, publicWitness)
+	assert.Nil(err)
+
+	// Sign the commitment
+	signature, err := issuerPrivateKey.Sign(commitment, hash.New())
+	assert.NoError(err, "signing message")
+
+	// check if there is no problem in the signature
+	pubKey := issuerPrivateKey.Public()
+	checkSig, err := pubKey.Verify(signature, commitment, hash.New())
+	assert.NoError(err, "verifying signature")
+	assert.True(checkSig, "signature verification failed")
+
+	// Now do redemption... create a new state
+	var newNonce big.Int
+	newNonce.Rand(randomness, snarkField)
+	var newCounter big.Int
+	newCounter.SetUint64(counter.Uint64() + 1)
+
+	// Compute commitment to this new state
+	var newCommitmentNonce big.Int
+	newCommitmentNonce.Rand(randomness, snarkField)
+	newMimc := hash.New()
+	newCommitmentNonce.FillBytes(buffer)
+	newMimc.Write(buffer)
+	nonce.FillBytes(buffer)
+	newMimc.Write(buffer)
+	newNonce.FillBytes(buffer)
+	newMimc.Write(buffer)
+	newCounter.FillBytes(buffer)
+	newMimc.Write(buffer)
+	newCommitment := newMimc.Sum(nil)
+
+	// Create:
+	// - new state (nonce', counter+1)
+	// - commitment to new state
+	// - ZKP(know signature over old commitment with nonce, counter += 1, counter < LIMIT)
+	var updatedCircuit updatedRateLimitedTokenCircuit
+	updatedCircuit.curveID = curve
+
+	// Construct the witness for verification of the updated token state
+	var updatedWitness updatedRateLimitedTokenCircuit
+	updatedWitness.curveID = curve
+	updatedWitness.PreviousCounter = counter
+	updatedWitness.PreviousCommitment = commitment
+	updatedWitness.PublicNonce = nonce // make the old nonce public to the verifier
+	updatedWitness.CommitmentNonce = newCommitmentNonce
+	updatedWitness.PrivateNonce = newNonce
+	updatedWitness.Counter = newCounter
+	updatedWitness.Commitment = newCommitment
+	updatedWitness.VerifyingKey.Assign(curve, pubKey.Bytes())
+	updatedWitness.OriginKey.Assign(curve, originPrivateKey.Public().Bytes())
+	updatedWitness.IssuerKey.Assign(curve, issuerPrivateKey.Public().Bytes())
+	updatedWitness.Signature.Assign(curve, signature)
+
+	// Check that it succeeds
+	assert.SolvingSucceeded(&updatedCircuit, &updatedWitness, test.WithCurves(snarkCurve))
+
+	// Send:
+	// - old state nonce (this is sent in the witness for the proof)
+	// - new state (this is sent in the witness)
+	// - ZKP (this is part of the proof)
+
+	// Setup the proof system
+	cs, err = frontend.Compile(snarkField, r1cs.NewBuilder, &updatedCircuit)
+	assert.Nil(err)
+	pk, vk, err = groth16.Setup(cs)
+	assert.Nil(err)
+
+	// Create the proof of the initial token state
+	newAssignment := &updatedRateLimitedTokenCircuit{
+		curveID:            curve,
+		PreviousCounter:    counter,
+		PreviousCommitment: commitment,
+		PublicNonce:        nonce,
+		CommitmentNonce:    newCommitmentNonce,
+		PrivateNonce:       newNonce,
+		Counter:            newCounter,
+		Commitment:         newCommitment,
+	}
+	newAssignment.VerifyingKey.Assign(curve, pubKey.Bytes())
+	newAssignment.OriginKey.Assign(curve, originPrivateKey.Public().Bytes())
+	newAssignment.IssuerKey.Assign(curve, issuerPrivateKey.Public().Bytes())
+	newAssignment.Signature.Assign(curve, signature)
+	proofWitness, err = frontend.NewWitness(newAssignment, snarkField)
+	assert.Nil(err)
+	proof, err = groth16.Prove(cs, pk, proofWitness)
+	assert.Nil(err)
+
+	// Verify the proof
+	publicWitness, err = proofWitness.Public()
+	assert.Nil(err)
+	err = groth16.Verify(proof, vk, publicWitness)
+	assert.Nil(err)
+
+	// Sign the commitment
+	updatedSignature, err := originPrivateKey.Sign(newCommitment, hash.New())
+	assert.NoError(err, "signing message")
+
+	// XXX(caw): update the state again, but this time fail because the limit was hit
+
+	var finalNonce big.Int
+	finalNonce.Rand(randomness, snarkField)
+	var finalCounter big.Int
+	finalCounter.SetUint64(newCounter.Uint64() + 1)
+
+	// Compute commitment to this new state
+	var finalCommitmentNonce big.Int
+	finalCommitmentNonce.Rand(randomness, snarkField)
+	finalMimc := hash.New()
+	finalCommitmentNonce.FillBytes(buffer)
+	finalMimc.Write(buffer)
+	nonce.FillBytes(buffer)
+	finalMimc.Write(buffer)
+	newNonce.FillBytes(buffer)
+	finalMimc.Write(buffer)
+	newCounter.FillBytes(buffer)
+	finalMimc.Write(buffer)
+	finalCommitment := finalMimc.Sum(nil)
+
+	// Create:
+	// - new state (nonce', counter+1)
+	// - commitment to new state
+	// - ZKP(know signature over old commitment with nonce, counter += 1, counter < LIMIT)
+	var finalCircuit updatedRateLimitedTokenCircuit
+	finalCircuit.curveID = curve
+
+	// Construct the witness for verification of the updated token state
+	var finalWitness updatedRateLimitedTokenCircuit
+	finalWitness.curveID = curve
+	finalWitness.PreviousCounter = newCounter
+	finalWitness.PreviousCommitment = newCommitment
+	finalWitness.PublicNonce = newNonce // make the old nonce public to the verifier
+	finalWitness.CommitmentNonce = finalCommitmentNonce
+	finalWitness.PrivateNonce = finalNonce
+	finalWitness.Counter = finalCounter
+	finalWitness.Commitment = finalCommitment
+	finalWitness.VerifyingKey.Assign(curve, originPrivateKey.Public().Bytes())
+	finalWitness.OriginKey.Assign(curve, originPrivateKey.Public().Bytes())
+	finalWitness.IssuerKey.Assign(curve, issuerPrivateKey.Public().Bytes())
+	finalWitness.Signature.Assign(curve, updatedSignature)
+
+	// Check that it succeeds
+	assert.SolvingSucceeded(&finalCircuit, &finalWitness, test.WithCurves(snarkCurve))
 }
