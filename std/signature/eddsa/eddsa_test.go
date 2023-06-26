@@ -488,5 +488,5 @@ func TestMyCircuit(t *testing.T) {
 	finalWitness.Signature.Assign(curve, updatedSignature)
 
 	// Check that it fails (since the limit is hit)
-	assert.SolvingSucceeded(&finalCircuit, &finalWitness, test.WithCurves(snarkCurve))
+	assert.SolvingFailed(&finalCircuit, &finalWitness, test.WithCurves(snarkCurve))
 }
